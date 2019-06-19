@@ -83,11 +83,13 @@
 #define FF_QSCALE_TYPE_H264  2
 #define FF_QSCALE_TYPE_VP56  3
 
-#define FF_SANE_NB_CHANNELS 64U
+#define FF_SANE_NB_CHANNELS 256U
 
 #define FF_SIGNBIT(x) ((x) >> CHAR_BIT * sizeof(x) - 1)
 
-#if HAVE_SIMD_ALIGN_32
+#if HAVE_SIMD_ALIGN_64
+#   define STRIDE_ALIGN 64 /* AVX-512 */
+#elif HAVE_SIMD_ALIGN_32
 #   define STRIDE_ALIGN 32
 #elif HAVE_SIMD_ALIGN_16
 #   define STRIDE_ALIGN 16
@@ -216,6 +218,14 @@ typedef struct AVCodecInternal {
 
     /* to prevent infinite loop on errors when draining */
     int nb_draining_errors;
+
+    /* used when avctx flag AV_CODEC_FLAG_DROPCHANGED is set */
+    int changed_frames_dropped;
+    int initial_format;
+    int initial_width, initial_height;
+    int initial_sample_rate;
+    int initial_channels;
+    uint64_t initial_channel_layout;
 } AVCodecInternal;
 
 struct AVCodecDefault {
@@ -233,20 +243,7 @@ int ff_match_2uint16(const uint16_t (*tab)[2], int size, int a, int b);
 
 unsigned int avpriv_toupper4(unsigned int x);
 
-/**
- * does needed setup of pkt_pts/pos and such for (re)get_buffer();
- */
-int ff_init_buffer_info(AVCodecContext *s, AVFrame *frame);
-
-
 void ff_color_frame(AVFrame *frame, const int color[4]);
-
-extern volatile int ff_avcodec_locked;
-int ff_lock_avcodec(AVCodecContext *log_ctx, const AVCodec *codec);
-int ff_unlock_avcodec(const AVCodec *codec);
-
-int avpriv_lock_avformat(void);
-int avpriv_unlock_avformat(void);
 
 /**
  * Maximum size in bytes of extradata.
@@ -414,6 +411,18 @@ int ff_alloc_a53_sei(const AVFrame *frame, size_t prefix_len,
  * bits per pixel.
  */
 int64_t ff_guess_coded_bitrate(AVCodecContext *avctx);
+
+/**
+ * Check if a value is in the list. If not, return the default value
+ *
+ * @param ctx                Context for the log msg
+ * @param val_name           Name of the checked value, for log msg
+ * @param array_valid_values Array of valid int, ended with INT_MAX
+ * @param default_value      Value return if checked value is not in the array
+ * @return                   Value or default_value.
+ */
+int ff_int_from_list_or_default(void *ctx, const char * val_name, int val,
+                                const int * array_valid_values, int default_value);
 
 #if defined(_WIN32) && CONFIG_SHARED && !defined(BUILDING_avcodec)
 #    define av_export_avcodec __declspec(dllimport)

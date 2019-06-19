@@ -247,6 +247,11 @@ static void init_band_stepsize(AVCodecContext *avctx,
         }
     }
 
+    if (band->f_stepsize > (INT_MAX >> 15)) {
+        band->f_stepsize = 0;
+        av_log(avctx, AV_LOG_ERROR, "stepsize out of range\n");
+    }
+
     band->i_stepsize = band->f_stepsize * (1 << 15);
 
     /* FIXME: In OpenJPEG code stepsize = stepsize * 0.5. Why?
@@ -359,7 +364,6 @@ static int init_prec(Jpeg2000Band *band,
 
         cblk->lblock    = 3;
         cblk->length    = 0;
-        memset(cblk->lengthinc, 0, sizeof(cblk->lengthinc));
         cblk->npasses   = 0;
     }
 
@@ -542,6 +546,9 @@ int ff_jpeg2000_init_component(Jpeg2000Component *comp,
         if (!reslevel->band)
             return AVERROR(ENOMEM);
 
+        if (reslevel->num_precincts_x * (uint64_t)reslevel->num_precincts_y * reslevel->nbands > avctx->max_pixels / sizeof(*reslevel->band->prec))
+            return AVERROR(ENOMEM);
+
         for (bandno = 0; bandno < reslevel->nbands; bandno++, gbandno++) {
             ret = init_band(avctx, reslevel,
                             comp, codsty, qntsty,
@@ -607,6 +614,8 @@ void ff_jpeg2000_cleanup(Jpeg2000Component *comp, Jpeg2000CodingStyle *codsty)
                             Jpeg2000Cblk *cblk = &prec->cblk[cblkno];
                             av_freep(&cblk->data);
                             av_freep(&cblk->passes);
+                            av_freep(&cblk->lengthinc);
+                            av_freep(&cblk->data_start);
                         }
                         av_freep(&prec->cblk);
                     }

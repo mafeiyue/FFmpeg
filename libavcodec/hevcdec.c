@@ -151,12 +151,18 @@ static int pred_weight_table(HEVCContext *s, GetBitContext *gb)
     int luma_log2_weight_denom;
 
     luma_log2_weight_denom = get_ue_golomb_long(gb);
-    if (luma_log2_weight_denom < 0 || luma_log2_weight_denom > 7)
+    if (luma_log2_weight_denom < 0 || luma_log2_weight_denom > 7) {
         av_log(s->avctx, AV_LOG_ERROR, "luma_log2_weight_denom %d is invalid\n", luma_log2_weight_denom);
+        return AVERROR_INVALIDDATA;
+    }
     s->sh.luma_log2_weight_denom = av_clip_uintp2(luma_log2_weight_denom, 3);
     if (s->ps.sps->chroma_format_idc != 0) {
-        int delta = get_se_golomb(gb);
-        s->sh.chroma_log2_weight_denom = av_clip_uintp2(s->sh.luma_log2_weight_denom + delta, 3);
+        int64_t chroma_log2_weight_denom = luma_log2_weight_denom + (int64_t)get_se_golomb(gb);
+        if (chroma_log2_weight_denom < 0 || chroma_log2_weight_denom > 7) {
+            av_log(s->avctx, AV_LOG_ERROR, "chroma_log2_weight_denom %"PRId64" is invalid\n", chroma_log2_weight_denom);
+            return AVERROR_INVALIDDATA;
+        }
+        s->sh.chroma_log2_weight_denom = chroma_log2_weight_denom;
     }
 
     for (i = 0; i < s->sh.nb_refs[L0]; i++) {
@@ -402,6 +408,21 @@ static enum AVPixelFormat get_format(HEVCContext *s, const HEVCSPS *sps)
         *fmt++ = AV_PIX_FMT_CUDA;
 #endif
         break;
+    case AV_PIX_FMT_YUV444P:
+#if CONFIG_HEVC_VDPAU_HWACCEL
+        *fmt++ = AV_PIX_FMT_VDPAU;
+#endif
+#if CONFIG_HEVC_NVDEC_HWACCEL
+        *fmt++ = AV_PIX_FMT_CUDA;
+#endif
+        break;
+    case AV_PIX_FMT_YUV420P12:
+    case AV_PIX_FMT_YUV444P10:
+    case AV_PIX_FMT_YUV444P12:
+#if CONFIG_HEVC_NVDEC_HWACCEL
+        *fmt++ = AV_PIX_FMT_CUDA;
+#endif
+        break;
     }
 
     *fmt++ = sps->pix_fmt;
@@ -474,6 +495,11 @@ static int hls_slice_header(HEVCContext *s)
 
     // Coded parameters
     sh->first_slice_in_pic_flag = get_bits1(gb);
+    if (s->ref && sh->first_slice_in_pic_flag) {
+        av_log(s->avctx, AV_LOG_ERROR, "Two slices reporting being the first in the same frame.\n");
+        return 1; // This slice will be skiped later, do not corrupt state
+    }
+
     if ((IS_IDR(s) || IS_BLA(s)) && sh->first_slice_in_pic_flag) {
         s->seq_decode = (s->seq_decode + 1) & 0xff;
         s->max_ra     = INT_MAX;
@@ -2904,6 +2930,18 @@ static int decode_nal_unit(HEVCContext *s, const H2645NAL *nal)
         ret = hls_slice_header(s);
         if (ret < 0)
             return ret;
+        if (ret == 1) {
+            ret = AVERROR_INVALIDDATA;
+            goto fail;
+        }
+
+
+        if (
+            (s->avctx->skip_frame >= AVDISCARD_BIDIR && s->sh.slice_type == HEVC_SLICE_B) ||
+            (s->avctx->skip_frame >= AVDISCARD_NONINTRA && s->sh.slice_type != HEVC_SLICE_I) ||
+            (s->avctx->skip_frame >= AVDISCARD_NONKEY && !IS_IRAP(s))) {
+            break;
+        }
 
         if (s->sh.first_slice_in_pic_flag) {
             if (s->max_ra == INT_MAX) {
@@ -2924,6 +2962,7 @@ static int decode_nal_unit(HEVCContext *s, const H2645NAL *nal)
                     s->max_ra = INT_MIN;
             }
 
+            s->overlap ++;
             ret = hevc_frame_start(s);
             if (ret < 0)
                 return ret;
@@ -3002,11 +3041,12 @@ static int decode_nal_units(HEVCContext *s, const uint8_t *buf, int length)
     s->ref = NULL;
     s->last_eos = s->eos;
     s->eos = 0;
+    s->overlap = 0;
 
     /* split the input packet into NAL units, so we know the upper bound on the
      * number of slices in the frame */
     ret = ff_h2645_packet_split(&s->pkt, buf, length, s->avctx, s->is_nalff,
-                                s->nal_length_size, s->avctx->codec_id, 1);
+                                s->nal_length_size, s->avctx->codec_id, 1, 0);
     if (ret < 0) {
         av_log(s->avctx, AV_LOG_ERROR,
                "Error splitting the input into NAL units.\n");
@@ -3028,7 +3068,16 @@ static int decode_nal_units(HEVCContext *s, const uint8_t *buf, int length)
 
     /* decode the NAL units */
     for (i = 0; i < s->pkt.nb_nals; i++) {
-        ret = decode_nal_unit(s, &s->pkt.nals[i]);
+        H2645NAL *nal = &s->pkt.nals[i];
+
+        if (s->avctx->skip_frame >= AVDISCARD_ALL ||
+            (s->avctx->skip_frame >= AVDISCARD_NONREF
+            && ff_hevc_nal_is_nonref(nal->type)))
+            continue;
+
+        ret = decode_nal_unit(s, nal);
+        if (ret >= 0 && s->overlap > 2)
+            ret = AVERROR_INVALIDDATA;
         if (ret < 0) {
             av_log(s->avctx, AV_LOG_WARNING,
                    "Error parsing NAL unit #%d.\n", i);
@@ -3263,15 +3312,7 @@ static av_cold int hevc_decode_free(AVCodecContext *avctx)
         av_frame_free(&s->DPB[i].frame);
     }
 
-    for (i = 0; i < FF_ARRAY_ELEMS(s->ps.vps_list); i++)
-        av_buffer_unref(&s->ps.vps_list[i]);
-    for (i = 0; i < FF_ARRAY_ELEMS(s->ps.sps_list); i++)
-        av_buffer_unref(&s->ps.sps_list[i]);
-    for (i = 0; i < FF_ARRAY_ELEMS(s->ps.pps_list); i++)
-        av_buffer_unref(&s->ps.pps_list[i]);
-    s->ps.sps = NULL;
-    s->ps.pps = NULL;
-    s->ps.vps = NULL;
+    ff_hevc_ps_uninit(&s->ps);
 
     av_freep(&s->sh.entry_point_offset);
     av_freep(&s->sh.offset);
@@ -3341,6 +3382,7 @@ fail:
     return AVERROR(ENOMEM);
 }
 
+#if HAVE_THREADS
 static int hevc_update_thread_context(AVCodecContext *dst,
                                       const AVCodecContext *src)
 {
@@ -3422,6 +3464,7 @@ static int hevc_update_thread_context(AVCodecContext *dst,
 
     return 0;
 }
+#endif
 
 static av_cold int hevc_decode_init(AVCodecContext *avctx)
 {
@@ -3461,6 +3504,7 @@ static av_cold int hevc_decode_init(AVCodecContext *avctx)
     return 0;
 }
 
+#if HAVE_THREADS
 static av_cold int hevc_init_thread_copy(AVCodecContext *avctx)
 {
     HEVCContext *s = avctx->priv_data;
@@ -3474,6 +3518,7 @@ static av_cold int hevc_init_thread_copy(AVCodecContext *avctx)
 
     return 0;
 }
+#endif
 
 static void hevc_decode_flush(AVCodecContext *avctx)
 {
@@ -3512,8 +3557,8 @@ AVCodec ff_hevc_decoder = {
     .close                 = hevc_decode_free,
     .decode                = hevc_decode_frame,
     .flush                 = hevc_decode_flush,
-    .update_thread_context = hevc_update_thread_context,
-    .init_thread_copy      = hevc_init_thread_copy,
+    .update_thread_context = ONLY_IF_THREADS_ENABLED(hevc_update_thread_context),
+    .init_thread_copy      = ONLY_IF_THREADS_ENABLED(hevc_init_thread_copy),
     .capabilities          = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_DELAY |
                              AV_CODEC_CAP_SLICE_THREADS | AV_CODEC_CAP_FRAME_THREADS,
     .caps_internal         = FF_CODEC_CAP_INIT_THREADSAFE | FF_CODEC_CAP_EXPORTS_CROPPING,

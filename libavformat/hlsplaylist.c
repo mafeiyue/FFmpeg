@@ -35,8 +35,23 @@ void ff_hls_write_playlist_version(AVIOContext *out, int version) {
     avio_printf(out, "#EXT-X-VERSION:%d\n", version);
 }
 
+void ff_hls_write_audio_rendition(AVIOContext *out, char *agroup,
+                                  char *filename, char *language, int name_id, int is_default) {
+    if (!out || !agroup || !filename)
+        return;
+
+    avio_printf(out, "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"group_%s\"", agroup);
+    avio_printf(out, ",NAME=\"audio_%d\",DEFAULT=%s,", name_id, is_default ? "YES" : "NO");
+    if (language) {
+        avio_printf(out, "LANGUAGE=\"%s\",", language);
+    }
+    avio_printf(out, "URI=\"%s\"\n", filename);
+}
+
 void ff_hls_write_stream_info(AVStream *st, AVIOContext *out,
-                              int bandwidth, char *filename) {
+                              int bandwidth, char *filename, char *agroup,
+                              char *codecs, char *ccgroup) {
+
     if (!out || !filename)
         return;
 
@@ -50,12 +65,18 @@ void ff_hls_write_stream_info(AVStream *st, AVIOContext *out,
     if (st && st->codecpar->width > 0 && st->codecpar->height > 0)
         avio_printf(out, ",RESOLUTION=%dx%d", st->codecpar->width,
                 st->codecpar->height);
+    if (codecs && strlen(codecs) > 0)
+        avio_printf(out, ",CODECS=\"%s\"", codecs);
+    if (agroup && strlen(agroup) > 0)
+        avio_printf(out, ",AUDIO=\"group_%s\"", agroup);
+    if (ccgroup && strlen(ccgroup) > 0)
+        avio_printf(out, ",CLOSED-CAPTIONS=\"%s\"", ccgroup);
     avio_printf(out, "\n%s\n\n", filename);
 }
 
 void ff_hls_write_playlist_header(AVIOContext *out, int version, int allowcache,
                                   int target_duration, int64_t sequence,
-                                  uint32_t playlist_type) {
+                                  uint32_t playlist_type, int iframe_mode) {
     if (!out)
         return;
     ff_hls_write_playlist_version(out, version);
@@ -70,6 +91,9 @@ void ff_hls_write_playlist_header(AVIOContext *out, int version, int allowcache,
         avio_printf(out, "#EXT-X-PLAYLIST-TYPE:EVENT\n");
     } else if (playlist_type == PLAYLIST_TYPE_VOD) {
         avio_printf(out, "#EXT-X-PLAYLIST-TYPE:VOD\n");
+    }
+    if (iframe_mode) {
+        avio_printf(out, "#EXT-X-I-FRAMES-ONLY\n");
     }
 }
 
@@ -87,7 +111,8 @@ int ff_hls_write_file_entry(AVIOContext *out, int insert_discont,
                              double duration, int round_duration,
                              int64_t size, int64_t pos, //Used only if HLS_SINGLE_FILE flag is set
                              char *baseurl, //Ignored if NULL
-                             char *filename, double *prog_date_time) {
+                             char *filename, double *prog_date_time,
+                             int64_t video_keyframe_size, int64_t video_keyframe_pos, int iframe_mode) {
     if (!out || !filename)
         return AVERROR(EINVAL);
 
@@ -99,7 +124,8 @@ int ff_hls_write_file_entry(AVIOContext *out, int insert_discont,
     else
         avio_printf(out, "#EXTINF:%f,\n", duration);
     if (byterange_mode)
-        avio_printf(out, "#EXT-X-BYTERANGE:%"PRId64"@%"PRId64"\n", size, pos);
+        avio_printf(out, "#EXT-X-BYTERANGE:%"PRId64"@%"PRId64"\n", iframe_mode ? video_keyframe_size : size,
+                    iframe_mode ? video_keyframe_pos : pos);
 
     if (prog_date_time) {
         time_t tt, wrongsecs;
